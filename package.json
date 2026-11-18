@@ -1,0 +1,32 @@
+{
+  "name": "moto-pecas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "E-commerce didático de moto peças com API REST e MongoDB em memória.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "check": "node --check src/server.js && node --check src/database.js && node --check src/security.js && node --check src/shop.js && node --check public/app.js"
+  },
+  "config": {
+    "mongodbMemoryServer": {
+      "downloadDir": "./.cache/mongodb",
+      "disablePostinstall": true
+    }
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.4",
+    "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
+    "mongodb": "^7.9.0",
+    "mongodb-memory-server": "^11.3.0",
+    "swagger-ui-express": "^5.0.1",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  }
+}

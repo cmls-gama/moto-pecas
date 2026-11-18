@@ -1,0 +1,454 @@
+openapi: 3.0.3
+info:
+  title: Moto Peças API
+  version: 1.0.0
+  description: |
+    API REST do e-commerce demonstrativo Moto Peças. Não processa pagamentos reais.
+    Banco e sessões são temporários e reiniciados junto com o servidor.
+
+    **Valores monetários são inteiros em centavos de real.** Dinheiro (`cash`)
+    dá 10% de desconto no subtotal dos produtos, arredondado ao centavo mais próximo.
+    Cartão (`card`) não tem desconto. Frete fixo de 2000 centavos para não VIP.
+    VIP exige acumulado >= 30000 centavos em produtos após descontos, sem frete.
+    A compra que atinge o limite ainda usa a condição anterior; o frete grátis
+    passa a valer na próxima compra. Estoque só é consumido na finalização.
+
+    Autenticação por cookie HttpOnly `moto.sid`, com validade de duas horas.
+    Faça login aqui e use os endpoints protegidos no mesmo navegador/origem.
+    No curl, armazene os cookies com `-c cookies.txt` e envie com `-b cookies.txt`.
+    Mutações exigem Content-Type application/json, inclusive DELETE e logout.
+    A aplicação rejeita Origin diferente da sua própria origem (403).
+    Os corpos de requisição aceitam apenas os campos documentados (400 para extras).
+    Limite de corpo: 16 KB (413). Login e cadastro compartilham limite de
+    50 tentativas por IP a cada 15 minutos (429).
+servers:
+  - url: /api
+    description: API da mesma origem do site
+tags:
+  - name: Infraestrutura
+  - name: Catálogo
+  - name: Autenticação
+  - name: Carrinho
+  - name: Finalização
+paths:
+  /health:
+    get:
+      tags: [Infraestrutura]
+      summary: Verificar disponibilidade da aplicação
+      operationId: health
+      responses:
+        '200':
+          description: Servidor e banco inicializados
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, database]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  database: { type: string, enum: [in-memory] }
+  /products:
+    get:
+      tags: [Catálogo]
+      summary: Listar os três produtos e seus estoques atuais
+      operationId: listProducts
+      responses:
+        '200':
+          description: Catálogo público
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [products]
+                properties:
+                  products:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+  /auth/register:
+    post:
+      tags: [Autenticação]
+      summary: Cadastrar cliente e iniciar sessão
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100, example: João Silva }
+                email: { type: string, format: email, maxLength: 254, example: joao@example.com }
+                password: { type: string, format: password, minLength: 8, maxLength: 128, example: Moto@123 }
+      responses:
+        '201':
+          description: Cliente criado com acumulado zero; cookie de sessão enviado
+          headers:
+            Set-Cookie: { schema: { type: string }, description: Cookie HttpOnly moto.sid }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/login:
+    post:
+      tags: [Autenticação]
+      summary: Iniciar sessão com e-mail e senha
+      description: E-mail é normalizado para minúsculas. Senhas diferenciam maiúsculas de minúsculas.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, maxLength: 254, example: bruno@motopecas.com }
+                password: { type: string, format: password, minLength: 8, maxLength: 128, example: Moto@123 }
+      responses:
+        '200':
+          description: Sessão iniciada; identificador de sessão regenerado
+          headers:
+            Set-Cookie: { schema: { type: string }, description: Cookie HttpOnly moto.sid }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/me:
+    get:
+      tags: [Autenticação]
+      summary: Consultar cliente da sessão e condição VIP
+      operationId: currentUser
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200':
+          description: Dados públicos do cliente
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      tags: [Autenticação]
+      summary: Encerrar sessão e limpar cookie
+      description: Envie Content-Type application/json e corpo {}. Operação permitida mesmo sem sessão ativa.
+      operationId: logout
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, example: {} }
+      responses:
+        '204': { description: Sessão encerrada; resposta sem corpo }
+  /cart:
+    get:
+      tags: [Carrinho]
+      summary: Consultar o carrinho do cliente autenticado
+      description: Não reserva estoque. Retorna preços atuais e simulação para os dois pagamentos.
+      operationId: getCart
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200':
+          description: Carrinho e totais calculados pelo servidor; frete zero em carrinho vazio
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cart' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /cart/items:
+    post:
+      tags: [Carrinho]
+      summary: Adicionar unidades de um produto ao carrinho
+      description: Soma à quantidade já presente. A quantidade resultante deve ser <= estoque atual e <= 99.
+      operationId: addCartItem
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [productId, quantity]
+              properties:
+                productId: { $ref: '#/components/schemas/ProductId' }
+                quantity: { type: integer, minimum: 1, maximum: 99, example: 1 }
+      responses:
+        '201':
+          description: Carrinho atualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /cart/items/{productId}:
+    parameters:
+      - name: productId
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ProductId' }
+    patch:
+      tags: [Carrinho]
+      summary: Substituir a quantidade de um item do carrinho
+      description: O item deve existir. Para remover, use DELETE. Estoque é revalidado.
+      operationId: updateCartItem
+      security: [{ cookieAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [quantity]
+              properties:
+                quantity: { type: integer, minimum: 1, maximum: 99, example: 2 }
+      responses:
+        '200':
+          description: Carrinho atualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Carrinho]
+      summary: Remover item do carrinho
+      description: Envie Content-Type application/json. O item deve existir no carrinho do cliente.
+      operationId: removeCartItem
+      security: [{ cookieAuth: [] }]
+      responses:
+        '200':
+          description: Carrinho atualizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /checkout:
+    post:
+      tags: [Finalização]
+      summary: Finalizar a compra com endereço e forma de pagamento
+      description: |
+        Em uma transação: revalida estoque, calcula totais, baixa estoque, cria pedido,
+        atualiza o acumulado do cliente e esvazia seu carrinho. Falhas revertem tudo.
+        Não aceita preços, descontos, totais, frete ou condição VIP enviados pelo cliente.
+        Use um UUID novo por compra no cabeçalho Idempotency-Key. Ao repetir uma chave
+        já concluída para o mesmo cliente, retorna o pedido original sem nova cobrança,
+        baixa ou alteração de carrinho, mesmo se o corpo da repetição for diferente.
+      operationId: checkout
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: UUID gerado para esta tentativa de compra; reutilize somente em repetição da mesma compra.
+          schema: { type: string, format: uuid, example: 8ee6331b-267c-4c3a-91e7-573733ff73ed }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [paymentMethod, address]
+              properties:
+                paymentMethod: { type: string, enum: [cash, card], example: cash }
+                address: { $ref: '#/components/schemas/Address' }
+      responses:
+        '201':
+          description: Pedido concluído (ou recuperado por idempotência) e cliente atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order, user]
+                properties:
+                  order: { $ref: '#/components/schemas/Order' }
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /orders/{orderId}:
+    get:
+      tags: [Finalização]
+      summary: Recuperar a confirmação de um pedido próprio
+      operationId: getOrder
+      security: [{ cookieAuth: [] }]
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Pedido do cliente autenticado
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order]
+                properties:
+                  order: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: moto.sid
+      description: Faça POST /auth/login ou /auth/register. O navegador gerencia o cookie HttpOnly.
+  responses:
+    BadRequest:
+      description: Dados inválidos, campos extras, JSON malformado, chave idempotente inválida/ausente ou carrinho vazio
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Sessão ausente/expirada ou credenciais incorretas
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Produto, item do carrinho ou pedido próprio não encontrado
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Estoque insuficiente, produto indisponível, e-mail duplicado ou conflito de unicidade
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Limite de tentativas de autenticação excedido (50 por IP em 15 minutos)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    ProductId:
+      type: string
+      minLength: 1
+      maxLength: 80
+      pattern: '^[a-z0-9-]+$'
+      example: kit-relacao
+    Product:
+      type: object
+      required: [id, name, category, description, priceCents, stock, image, tag]
+      properties:
+        id: { $ref: '#/components/schemas/ProductId' }
+        name: { type: string, example: Kit de relação }
+        category: { type: string, example: TRANSMISSÃO }
+        description: { type: string }
+        priceCents: { type: integer, minimum: 0, example: 18990 }
+        stock: { type: integer, minimum: 0, example: 8 }
+        image: { type: string, example: /images/kit-relacao.svg }
+        tag: { type: string, example: ESSENCIAL }
+    User:
+      type: object
+      required: [id, name, email, totalSpentCents, isVip, remainingForVipCents]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Bruno Santos }
+        email: { type: string, format: email, example: bruno@motopecas.com }
+        totalSpentCents: { type: integer, minimum: 0, example: 25000 }
+        isVip: { type: boolean, example: false }
+        remainingForVipCents: { type: integer, minimum: 0, example: 5000 }
+    UserResponse:
+      type: object
+      required: [user]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+    Totals:
+      type: object
+      required: [subtotalCents, discountCents, shippingCents, totalCents]
+      properties:
+        subtotalCents: { type: integer, minimum: 0, example: 18990 }
+        discountCents: { type: integer, minimum: 0, example: 1899 }
+        shippingCents: { type: integer, minimum: 0, example: 2000 }
+        totalCents: { type: integer, minimum: 0, example: 19091 }
+    CartItem:
+      type: object
+      required: [productId, name, image, quantity, stock, unitPriceCents, lineTotalCents, available]
+      properties:
+        productId: { $ref: '#/components/schemas/ProductId' }
+        name: { type: string }
+        image: { type: string }
+        quantity: { type: integer, minimum: 1, maximum: 99 }
+        stock: { type: integer, minimum: 0 }
+        unitPriceCents: { type: integer, minimum: 0 }
+        lineTotalCents: { type: integer, minimum: 0 }
+        available: { type: boolean, description: Indica se o estoque atual cobre a quantidade do item }
+    Cart:
+      type: object
+      required: [items, itemCount, isVip, cash, card]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/CartItem' } }
+        itemCount: { type: integer, minimum: 0 }
+        isVip: { type: boolean }
+        cash: { $ref: '#/components/schemas/Totals' }
+        card: { $ref: '#/components/schemas/Totals' }
+    Address:
+      type: object
+      additionalProperties: false
+      required: [recipient, zipCode, street, number, city, state]
+      properties:
+        recipient: { type: string, minLength: 2, maxLength: 100, example: Bruno Santos }
+        zipCode: { type: string, pattern: '^\d{5}-?\d{3}$', example: 01001-000 }
+        street: { type: string, minLength: 2, maxLength: 150, example: Praça da Sé }
+        number: { type: string, minLength: 1, maxLength: 20, example: '100' }
+        complement: { type: string, maxLength: 100, default: '', example: Apto 10 }
+        city: { type: string, minLength: 2, maxLength: 100, example: São Paulo }
+        state: { type: string, enum: [AC, AL, AP, AM, BA, CE, DF, ES, GO, MA, MT, MS, MG, PA, PB, PR, PE, PI, RJ, RN, RS, RO, RR, SC, SP, SE, TO], example: SP }
+    OrderItem:
+      type: object
+      required: [productId, name, quantity, unitPriceCents, lineTotalCents]
+      properties:
+        productId: { $ref: '#/components/schemas/ProductId' }
+        name: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unitPriceCents: { type: integer, minimum: 0 }
+        lineTotalCents: { type: integer, minimum: 0 }
+    Order:
+      allOf:
+        - $ref: '#/components/schemas/Totals'
+        - type: object
+          required: [id, number, items, paymentMethod, address, wasVip, becameVip, createdAt]
+          properties:
+            id: { type: string, format: uuid }
+            number: { type: string, example: MP-7A4B15F0 }
+            items: { type: array, items: { $ref: '#/components/schemas/OrderItem' } }
+            paymentMethod: { type: string, enum: [cash, card] }
+            address: { $ref: '#/components/schemas/Address' }
+            wasVip: { type: boolean, description: Condição VIP antes desta compra, usada no frete }
+            becameVip: { type: boolean, description: Indica se esta compra atingiu o limite VIP pela primeira vez }
+            createdAt: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: INSUFFICIENT_STOCK }
+            message: { type: string, example: 'Estoque insuficiente. Disponível: 0 unidade(s).' }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string, example: address.zipCode }
+                  message: { type: string, example: Informe um CEP válido. }
